@@ -105,6 +105,14 @@ def main():
     ap.add_argument("--outer", type=int, default=40)
     ap.add_argument("--q", type=int, default=1500)
     ap.add_argument("--p", type=int, default=8)
+    ap.add_argument(
+        "--query-objective",
+        choices=("normalized_logit_l1", "softmax_js"),
+        default=None,
+        help="committee disagreement used to optimize queries (default: "
+             "normalized_logit_l1; use softmax_js for pairwise Jensen-Shannon "
+             "divergence between softmax probabilities).",
+    )
     ap.add_argument("--window", type=int, default=None,
                     help="override variant's sample window (in outer iters; "
                          "0 = keep all). Default: use the variant's value.")
@@ -152,6 +160,8 @@ def main():
     eval_pts = xte[:2000]
 
     overrides = dict(VARIANTS[args.variant])
+    if args.query_objective is not None:
+        overrides["query_objective"] = args.query_objective
     if args.window is not None:
         overrides["window"] = args.window
     if args.combine:

@@ -8,6 +8,7 @@ Baseline (paper-faithful):
     iteration; LR step-decay; return lowest-loss member.
 
 Variant hooks:
+  query_objective : 'normalized_logit_l1' (paper) | 'softmax_js'
   disagree      : 'mean_pair' (paper) | 'min_pair' | 'median_pair' | 'variance'
   query_box     : bound queries into [-box, box]^d via tanh parameterization
   query_div_w   : weight of inter-query repulsion penalty (query diversity)
@@ -48,6 +49,7 @@ class Cfg:
     qg_sched: tuple = (0.5, 0.8)
     qg_init_std: float = 0.5
     # variant switches
+    query_objective: str = "normalized_logit_l1"
     disagree: str = "mean_pair"
     query_box: float = 0.0     # 0 = unbounded (paper); else tanh box bound
     query_div_w: float = 0.0
@@ -111,19 +113,35 @@ def _normalize(v):
     return v / v.abs().sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-def disagreement(outs, mode):
+def disagreement(outs, mode, objective="normalized_logit_l1"):
     """outs: (p, q, out_dim) frozen committee outputs. Return loss to
     MINIMIZE (negative disagreement)."""
-    f = _normalize(outs)
-    if mode == "variance":
+    if objective == "normalized_logit_l1":
+        f = _normalize(outs)
+    elif objective == "softmax_js":
+        f = torch.log_softmax(outs, dim=-1)
+    else:
+        raise ValueError(f"unknown query objective: {objective}")
+
+    if mode == "variance" and objective == "normalized_logit_l1":
         mean = f.mean(dim=0, keepdim=True)
         var = ((f - mean) ** 2).sum(-1).mean(dim=0)  # per sample
         return -var.mean()
-    # pairwise distance matrix per sample: (p, p, q)
-    D = (f.unsqueeze(1) - f.unsqueeze(0)).abs().sum(-1)
     p = f.shape[0]
     i, j = torch.triu_indices(p, p, offset=1, device=f.device)
-    pairs = D[i, j, :]  # (n_pairs, q)
+    if objective == "normalized_logit_l1":
+        # Pairwise normalized-logit L1 distance: (n_pairs, q).
+        pairs = (f[i] - f[j]).abs().sum(-1)
+    else:
+        if mode == "variance":
+            raise ValueError("variance reduction is not defined for JS")
+        # Jensen-Shannon divergence between softmax distributions.
+        log_pi, log_pj = f[i], f[j]
+        log_m = torch.logaddexp(log_pi, log_pj) - math.log(2.0)
+        pairs = 0.5 * (
+            (log_pi.exp() * (log_pi - log_m)).sum(-1)
+            + (log_pj.exp() * (log_pj - log_m)).sum(-1)
+        )
     if mode == "mean_pair":
         per_sample = pairs.mean(dim=0)
     elif mode == "min_pair":
@@ -174,7 +192,7 @@ def gen_queries(pop, cfg, input_dim, device, gen, losses=None):
                 g["lr"] /= 10
         I = feats()
         outs = torch.stack([net(I) for net in members])  # (p', q, out)
-        loss = disagreement(outs, cfg.disagree)
+        loss = disagreement(outs, cfg.disagree, cfg.query_objective)
         if cfg.query_div_w > 0:
             loss = loss + cfg.query_div_w * _repulsion(I)
         opt.zero_grad()
