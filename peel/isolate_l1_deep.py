@@ -4,7 +4,11 @@ layer-1 neurons saturate, so the black-box Jacobian is rank one with row = w_i. 
 growing t; accept the direction common to all M Jacobian row spaces (eigenvalue == M).
 Downstream widths are irrelevant (no narrowing needed). Usage:
   python peel/isolate_l1_deep.py <pop_or_net.pt> <guess_net.pt> <neurons: a-b or comma list> <out.pt> [gpu]
-Prints the truth-based direction error for SCORING only."""
+Prints the truth-based direction error for SCORING only.
+Black-box acceptance (bb_err, used by l1_pipeline.py unless L1_GATE=oracle): the final round must be accepted with a
+ONE-dimensional common Jacobian row space (a >1-dim common space means another unsaturated unit shares it, so the
+projection is ambiguous), and bb_err = sign-invariant change of the direction in that final round (rounds at t=1000
+and t=3000 must agree once the unit is isolated). inf when the final round fails."""
 import sys, os, time, math, torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from nets import MLP
@@ -12,7 +16,7 @@ from tanh_solve import Oracle, measure_jets
 from align import sign_align_clone, _preacts
 
 teacher_path, guess_path, spec, out_path = sys.argv[1:5]
-dev = f"cuda:{sys.argv[5]}" if len(sys.argv) > 5 else "cuda:0"
+dev = ("cpu" if sys.argv[5] == "cpu" else f"cuda:{sys.argv[5]}") if len(sys.argv) > 5 else "cuda:0"
 torch.manual_seed(0)
 ck = torch.load(teacher_path, map_location=dev, weights_only=False); dims = ck["dims"]
 teacher = MLP(dims, act="tanh").to(dev); teacher.load_state_dict(ck["teacher_state"])
@@ -42,6 +46,10 @@ S, Vh = torch.linalg.svd(J.reshape(-1, d), full_matrices=False)[1:]
 r = int((S > 1e-8 * S[0]).sum()); Vsub = Vh[:r]
 print(f"row space of W1: numerical rank {r} (sv[r-1]/sv0 {float(S[r-1]/S[0]):.1e}, sv[r]/sv0 {float(S[min(r, len(S)-1)]/S[0]):.1e}) | {bb.n} queries, {time.time()-t0:.0f}s", flush=True)
 
+def ddist(a, b):                                               # sign-invariant distance of unit directions
+    a = a / a.norm(); b = b / b.norm()
+    return float(torch.minimum((a - b).norm(), (a + b).norm()))
+
 def rand_perp(u):
     gg = torch.randn(d, dtype=torch.float64, device=dev)
     gg = Vsub.T @ (Vsub @ gg); gg = gg - (gg @ u) * u / (u @ u)
@@ -59,6 +67,7 @@ for i in neurons:
     w_hat = guess.layers[0].weight[i].detach().clone()
     w_hat = Vsub.T @ (Vsub @ w_hat)
     e0 = dir_err(w_hat, i); hist = [e0]; accepted = 0
+    bb_hist = []; cdims = []                                   # black-box per-round change / common-space dim
     for rnd, (t, M) in enumerate([(30, 6), (100, 6), (300, 6), (1000, 6), (3000, 6)]):
         u = w_hat / w_hat.norm()
         Psum = torch.zeros(d, d, dtype=torch.float64, device=dev); used = 0
@@ -73,7 +82,7 @@ for i in neurons:
             k = int((Sg > 1e-10 * Sg[0]).sum())
             Psum += Vh2[:k].T @ Vh2[:k]; used += 1
         if used == 0:
-            continue
+            bb_hist.append(float("inf")); cdims.append(0); continue
         ev, evec = torch.linalg.eigh(Psum)
         # the subspace COMMON to all M Jacobian row spaces (eigenvalue == used) can be more than
         # one-dimensional: a small-norm neuron that is unsaturated at every probe point sits in it
@@ -81,15 +90,21 @@ for i in neurons:
         # dir err ~1.4 from round 1). Pick the common-subspace vector nearest the guess instead,
         # and accept only if the guess lies mostly inside that subspace.
         common = evec[:, ev > used - 1e-3]
+        cdims.append(int(common.shape[1]))
         if common.shape[1] == 0:
-            hist.append(dir_err(w_hat, i)); continue
+            hist.append(dir_err(w_hat, i)); bb_hist.append(float("inf")); continue
         proj = common @ (common.T @ u)
         if float(proj.norm()) > 0.9:
             cand = proj / proj.norm()
+            bb_hist.append(ddist(cand, u))
             w_hat = cand * w_hat.norm(); accepted += 1
+        else:
+            bb_hist.append(float("inf"))
         hist.append(dir_err(w_hat, i))
-    results[i] = dict(direction=(w_hat / w_hat.norm()).cpu(), err_hist=hist, queries=bb.n - q0, accepted=accepted)
-    print(f"neuron {i:3d}: dir err {e0:.1e} -> {hist[-1]:.1e} (rounds accepted {accepted}/5; per round {' '.join(f'{h:.0e}' for h in hist[1:])}) | {bb.n - q0} queries, {time.time()-t_i:.0f}s", flush=True)
+    bb_err = bb_hist[-1] if (len(cdims) == 5 and cdims[-1] == 1) else float("inf")
+    results[i] = dict(direction=(w_hat / w_hat.norm()).cpu(), err_hist=hist, bb_hist=bb_hist, common_dims=cdims,
+                      bb_err=bb_err, queries=bb.n - q0, accepted=accepted)
+    print(f"neuron {i:3d}: dir err (teacher, scoring) {e0:.1e} -> {hist[-1]:.1e} | black-box err {bb_err:.1e} (per-round change {' '.join(f'{h:.0e}' for h in bb_hist)}; common dims {cdims}) (rounds accepted {accepted}/5) | {bb.n - q0} queries, {time.time()-t_i:.0f}s", flush=True)
 torch.save(dict(results=results, dims=dims, guess_path=guess_path, total_queries=bb.n), out_path)
-errs = [results[i]["err_hist"][-1] for i in results]
-print(f"DONE {len(results)} neurons | final dir err median {sorted(errs)[len(errs)//2]:.1e} max {max(errs):.1e} | within 1e-8: {sum(e < 1e-8 for e in errs)} | total queries {bb.n} | {time.time()-t0:.0f}s", flush=True)
+errs = [results[i]["err_hist"][-1] for i in results]; bbe = [results[i]["bb_err"] for i in results]
+print(f"DONE {len(results)} neurons | final dir err (scoring) median {sorted(errs)[len(errs)//2]:.1e} max {max(errs):.1e} | within 1e-8: {sum(e < 1e-8 for e in errs)} | black-box err < 1e-8: {sum(e < 1e-8 for e in bbe)} | total queries {bb.n} | {time.time()-t0:.0f}s", flush=True)

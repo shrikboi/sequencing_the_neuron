@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from nets import MLP
 from tanh_solve import Oracle, measure_jets
 guess_path, iso_path, sc_path, unit = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]); dev = f"cuda:{sys.argv[5] if len(sys.argv) > 5 else 0}"
+tag = sys.argv[6] if len(sys.argv) > 6 else "untagged"
 ck = torch.load(guess_path, map_location=dev, weights_only=False); dims = ck["dims"]
 teacher = MLP(dims, act="tanh").to(dev); teacher.load_state_dict(ck["teacher_state"]); teacher = teacher.double()
 bb = Oracle(lambda x: teacher(x.double())); d = dims[0]
@@ -54,7 +55,8 @@ g2 = torch.load(guess_path, map_location="cpu", weights_only=False)
 g2["state_dict"]["layers.0.weight"][unit] = (w.cpu() * 4.0).float()
 gp = guess_path.replace(".pt", f"_orphan{unit}.pt"); torch.save(g2, gp)
 out = iso_path.replace(".pt", f"_orphan{unit}.pt")
-subprocess.run(f"CUDA_VISIBLE_DEVICES={dev.split(':')[1]} /opt/miniconda3/bin/python peel/isolate_l1_deep.py {guess_path} {gp} {unit} {out} 0 > results/logs/iso_l1_orphan{unit}.log 2>&1", shell=True)
+subprocess.run(f"CUDA_VISIBLE_DEVICES={dev.split(':')[1]} {sys.executable} peel/isolate_l1_deep.py {guess_path} {gp} {unit} {out} 0 > results/logs/iso_l1_{tag}_orphaniso{unit}.log 2>&1", shell=True)
 r = torch.load(out, map_location="cpu", weights_only=False)["results"][unit]
 print(f"isolation rounds from the orphan guess: err {r['err_hist'][0]:.1e} -> {r['err_hist'][-1]:.1e}", flush=True)
+print(f"orphan search total queries {bb.n}", flush=True)
 res[unit] = dict(r, orphan=True); torch.save({"results": res, "dims": dims}, iso_path); print("merged file updated", flush=True)

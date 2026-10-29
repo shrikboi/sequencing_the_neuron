@@ -8,7 +8,37 @@ import sys, os, subprocess, time, torch
 tag, pop_path, final_path, gpus = sys.argv[1:5]
 CG = sys.argv[5] if len(sys.argv) > 5 else "2000"; IT = sys.argv[6] if len(sys.argv) > 6 else "10"
 gpus = gpus.split(","); R = "recon"; L = "results/logs"
-P = "/opt/miniconda3/bin/python"
+P = sys.executable
+# Unit-failure gate. "blackbox" (default): isolate_l1_deep's bb_err (final-round direction change with a 1-dim common
+# Jacobian space) < L1_BB_TOL, plus a duplicate check (two units isolated to the same direction cannot both be right).
+# "oracle": the original truth-based gate (direction error vs the teacher's W1 < 1e-8), kept only for comparison.
+GATE = os.environ.get("L1_GATE", "blackbox"); BB_TOL = float(os.environ.get("L1_BB_TOL", "1e-8"))
+assert GATE in ("blackbox", "oracle"), GATE
+def unit_err(r):
+    return r["err_hist"][-1] if GATE == "oracle" else r.get("bb_err", float("inf"))
+def unit_ok(r):
+    return unit_err(r) < (1e-8 if GATE == "oracle" else BB_TOL)
+def bad_units(res):
+    bad = {i for i, r in res.items() if not unit_ok(r)}
+    if GATE == "blackbox":                                     # duplicates among the accepted directions
+        ok = sorted(set(res) - bad)
+        if len(ok) > 1:
+            D = torch.stack([res[i]["direction"].double() for i in ok]); C = (D @ D.T).abs(); C.fill_diagonal_(0)
+            # each duplicate pair: keep the unit whose own guess was closest to the isolated direction (smallest
+            # first-round change, black-box); the other one is wrong and goes to orphan recovery
+            dup = set()
+            for a, b in (C > 1 - 1e-6).nonzero().tolist():
+                if a < b:
+                    ia, ib = ok[a], ok[b]
+                    dup.add(ib if res[ia]["bb_hist"][0] <= res[ib]["bb_hist"][0] else ia)
+            if dup: print(f"[pipeline] duplicate directions (black-box): units {sorted(dup)} -> treated as failed", flush=True)
+            bad |= dup
+    return sorted(bad)
+def score_gate(res, bad):                                      # SCORING ONLY: agreement with the truth-based gate
+    tb = {i for i, r in res.items() if not r["err_hist"][-1] < 1e-8}; b = set(bad)
+    print(f"[pipeline] gate={GATE} | scoring vs teacher (not used): {len(b & tb)} flagged&truly-bad, {len(b - tb)} flagged but truly fine, "
+          f"{len(tb - b)} MISSED (accepted, true dir err >= 1e-8; worst {max([res[i]['err_hist'][-1] for i in tb - b], default=0):.1e})", flush=True)
+print(f"[pipeline] unit gate: {GATE}" + (f" (tol {BB_TOL:g})" if GATE == "blackbox" else " (TRUTH-BASED, comparison only)"), flush=True)
 pop = torch.load(pop_path, map_location="cpu", weights_only=False); fin = torch.load(final_path, map_location="cpu", weights_only=False)
 dims = pop["dims"]; H = dims[1]
 guess = f"{R}/_guess__{tag}.pt"
@@ -19,6 +49,7 @@ from consensus_guess import consensus_guess
 _cs = None
 if os.environ.get("TRUNK", "consensus") == "consensus":
     _cs, _ = consensus_guess(pop, fin["state_dict"])
+    print("[pipeline] trunk gate total queries 4096", flush=True)      # consensus_guess's black-box sanity gate (upper bound)
 torch.save({"dims": dims, "act": "tanh", "teacher_state": pop["teacher_state"],
             "state_dict": _cs if _cs is not None else fin["state_dict"],
             "note": ("aligned quorum consensus" if _cs is not None else "best member") + f" of {final_path}"}, guess)
@@ -43,8 +74,9 @@ run_parallel([f"CUDA_VISIBLE_DEVICES={g} {P} peel/isolate_l1_deep.py {guess} {gu
 res = {}
 for s in range(len(shards(H))):
     res.update(torch.load(f"{R}/_iso_l1_shard{s}__{tag}.pt", map_location="cpu", weights_only=False)["results"])
-bad = [i for i, r in res.items() if r["err_hist"][-1] > 1e-8]
-print(f"[pipeline] isolation: {len(res)} neurons, {len(bad)} above 1e-8 ({time.time()-t0:.0f}s)", flush=True)
+bad = bad_units(res)
+print(f"[pipeline] isolation: {len(res)} neurons, {len(bad)} failed the {GATE} gate ({time.time()-t0:.0f}s)", flush=True)
+score_gate(res, bad)
 # 2. gap-fill the failures from other members' guesses. Members have DIFFERENT unit orders: pair the
 #    failed best-member unit i to member m's unit j by max |cos| of the W1 rows, isolate j with member m's
 #    guess, and accept only if the result still points along the best member's row (|cos| > 0.9).
@@ -59,10 +91,11 @@ for m in range(1, len(members)):
     g = torch.load(f"{R}/_iso_l1_gap{m}__{tag}.pt", map_location="cpu", weights_only=False)["results"]
     for i, j in pairs.items():
         r = g[j]; u = r["direction"].double()
-        if r["err_hist"][-1] < 1e-8 and abs(float(u @ g0n[i])) > 0.9: res[i] = r
-    bad = [i for i, r in res.items() if r["err_hist"][-1] > 1e-8]
+        if unit_ok(r) and abs(float(u @ g0n[i])) > 0.9: res[i] = r
+    bad = bad_units(res)
     print(f"[pipeline] gap-fill from member {m} ({len(pairs)} paired units): {len(bad)} still above 1e-8", flush=True)
 torch.save({"results": res, "dims": dims}, f"{R}/_iso_l1_merged__{tag}.pt")
+score_gate(res, bad)
 orphans = list(bad)   # units no member can seed: recovered after the scales via the row-space complement (orphan_l1.py)
 # 3. scales, sharded
 keys = sorted(res)
@@ -79,12 +112,12 @@ print(f"[pipeline] scales: {n_ok}/{len(sc)} usable ({time.time()-t1:.0f}s)", flu
 torch.save({"results": sc, "dims": dims}, f"{R}/_scale_l1_merged__{tag}.pt")
 # 3b. orphan units: row-space complement + saturating offset (needs the other rows' scales), then their scales
 for u in orphans:
-    subprocess.run(f"CUDA_VISIBLE_DEVICES={gpus[0]} {P} peel/diag/orphan_l1.py {guess} {R}/_iso_l1_merged__{tag}.pt {R}/_scale_l1_merged__{tag}.pt {u} 0 > {L}/iso_l1_{tag}_orphan{u}.log 2>&1", shell=True)
+    subprocess.run(f"CUDA_VISIBLE_DEVICES={gpus[0]} {P} peel/diag/orphan_l1.py {guess} {R}/_iso_l1_merged__{tag}.pt {R}/_scale_l1_merged__{tag}.pt {u} 0 {tag} > {L}/orphan_l1_{tag}_{u}.log 2>&1", shell=True)
     res = torch.load(f"{R}/_iso_l1_merged__{tag}.pt", map_location="cpu", weights_only=False)["results"]
     torch.save({"results": {u: res[u]}, "dims": dims}, f"{R}/_iso_l1_part_orphan{u}__{tag}.pt")
     subprocess.run(f"CUDA_VISIBLE_DEVICES={gpus[0]} {P} peel/scale_l1_deep.py {guess} {R}/_iso_l1_part_orphan{u}__{tag}.pt {R}/_scale_l1_orphan{u}__{tag}.pt 0 > {L}/scale_l1_{tag}_orphan{u}.log 2>&1", shell=True)
     sc.update(torch.load(f"{R}/_scale_l1_orphan{u}__{tag}.pt", map_location="cpu", weights_only=False)["results"])
-    print(f"[pipeline] orphan unit {u}: dir err {res[u]['err_hist'][-1]:.1e}, scale {'ok' if sc[u].get('scale') else 'FAILED'}", flush=True)
+    print(f"[pipeline] orphan unit {u}: black-box err {res[u].get('bb_err', float('nan')):.1e}, dir err (scoring) {res[u]['err_hist'][-1]:.1e}, scale {'ok' if sc[u].get('scale') else 'FAILED'}", flush=True)
     torch.save({"results": sc, "dims": dims}, f"{R}/_scale_l1_merged__{tag}.pt")
 # 4. assemble + refine (single GPU)
 t2 = time.time()

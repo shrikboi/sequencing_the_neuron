@@ -26,7 +26,12 @@ ap.add_argument("--disk", default=None); ap.add_argument("--disk-ram-gb", type=f
 ap.add_argument("--qg-block-gb", type=float, default=None); ap.add_argument("--qg-chunk-gb", type=float, default=None); ap.add_argument("--qg-tf32", action="store_true")
 ap.add_argument("--extra", default="", help="extra run.py flags, quoted")
 ap.add_argument("--skip-committee", action="store_true"); ap.add_argument("--skip-l1", action="store_true", help="force the shallow path (no isolation/scales)")
-ap.add_argument("--l1-threshold", type=float, default=1e-2, help="committee W1 max eps below this -> shallow path")
+ap.add_argument("--l1-threshold", type=float, default=1e-2, help="--l1-gate oracle only: committee W1 TRUE max eps below this -> shallow path")
+ap.add_argument("--l1-gate", choices=["consensus", "oracle"], default="consensus",
+                help="consensus (default, black-box): shallow path iff >= --l1-cons-frac of layer-1 units reached committee quorum "
+                     "consensus (students only), and the layer-1 pipeline gates units by black-box error. oracle: the original "
+                     "truth-based decisions (W1 error vs the teacher), for comparison only")
+ap.add_argument("--l1-cons-frac", type=float, default=0.95)
 ap.add_argument("--refine-cg", type=int, default=2000); ap.add_argument("--refine-iters", type=int, default=12)
 ap.add_argument("--polish-cg", type=int, default=4000); ap.add_argument("--polish-iters", type=int, default=12)
 ap.add_argument("--final-cg", type=int, default=4000); ap.add_argument("--final-iters", type=int, default=6)
@@ -95,10 +100,18 @@ record("1 committee", res["final_max_eps"], res["final_mean_eps"], int(res["quer
        f"certified {res['log'][-1].get('n_consensus')}/{res['log'][-1].get('n_total')} | W1 max {w1_max:.2e} | per-matrix max {' '.join(f'{x:.1e}' for x in res['final_max_eps_per_matrix'])}")
 
 # ---------------------------------------------------------------- 2. layer-1 pipeline + frozen refine
-shallow = args.skip_l1 or w1_max < args.l1_threshold
+_cl = (res["log"][-1].get("consensus_eps_per_layer") or [{}])[0] if res.get("log") else {}
+l1_cons, l1_tot = _cl.get("n_cons", 0), _cl.get("n_tot", dims[1])
+if args.l1_gate == "consensus":
+    shallow = args.skip_l1 or l1_cons >= args.l1_cons_frac * l1_tot
+    say(f"layer-1 gate (black-box): {l1_cons}/{l1_tot} units in committee consensus -> {'shallow' if shallow else 'deep'} path "
+        f"(scoring only, not used: true W1 max eps {w1_max:.1e})")
+else:
+    shallow = args.skip_l1 or w1_max < args.l1_threshold
+    say(f"layer-1 gate ORACLE (truth-based, comparison only): W1 max eps {w1_max:.1e} -> {'shallow' if shallow else 'deep'} path")
 import torch
 if shallow:
-    say(f"layer 1 already at {w1_max:.1e} < {args.l1_threshold:.0e}: shallow path, skipping isolation/scales")
+    say("shallow path, skipping isolation/scales")
     guess = f"{R}/_guess__{args.tag}.pt"
     pop = torch.load(pop_path, map_location="cpu", weights_only=False); fin = torch.load(final_path, map_location="cpu", weights_only=False)
     _cs = None
@@ -107,17 +120,24 @@ if shallow:
         from consensus_guess import consensus_guess
         _cs, _ = consensus_guess(pop, fin["state_dict"])
     say(f"solver starting net = {'aligned quorum CONSENSUS net' if _cs is not None else 'best member'}")
+    if args.trunk == "consensus":                      # consensus_guess's black-box sanity gate (4096 queries, upper bound)
+        record("1b trunk consensus gate", res["final_max_eps"], res["final_mean_eps"], 4096)
     torch.save({"dims": dims, "act": "tanh", "teacher_state": pop["teacher_state"], "state_dict": _cs if _cs is not None else fin["state_dict"]}, guess)
     base = guess
 else:
-    sh(f"TRUNK={args.trunk} {P} peel/diag/l1_pipeline.py {args.tag} {pop_path} {final_path} {args.gpus} {args.refine_cg} {args.refine_iters}", f"{L}/l1_pipeline__{args.tag}.log")
+    sh(f"TRUNK={args.trunk} L1_GATE={'blackbox' if args.l1_gate == 'consensus' else 'oracle'} {P} peel/diag/l1_pipeline.py {args.tag} {pop_path} {final_path} {args.gpus} {args.refine_cg} {args.refine_iters}", f"{L}/l1_pipeline__{args.tag}.log")
     guess = f"{R}/_guess__{args.tag}.pt"
-    q_iso = sum(queries_in(f"{L}/{f}", r"total queries (\d+)") for f in os.listdir(L) if f.startswith(f"iso_l1_{args.tag}") or f.startswith(f"iso_l1_orphan"))
-    q_sc = sum(queries_in(f"{L}/{f}", r"\| (\d+) q\b") for f in os.listdir(L) if f.startswith(f"scale_l1_{args.tag}"))
+    # every stage prints its oracle's total ("total queries N"): isolation shards + gap-fills + orphan re-isolations,
+    # scale shards + orphan scales (incl. their row-space jets), orphan searches, and the trunk gate
+    q_iso = sum(queries_in(f"{L}/{f}", r"total queries (\d+)") for f in os.listdir(L) if f.startswith(f"iso_l1_{args.tag}_"))
+    q_sc = sum(queries_in(f"{L}/{f}", r"total queries (\d+)") for f in os.listdir(L) if f.startswith(f"scale_l1_{args.tag}_"))
+    q_orph = sum(queries_in(f"{L}/{f}", r"orphan search total queries (\d+)") for f in os.listdir(L) if f.startswith(f"orphan_l1_{args.tag}_"))
+    q_gate = queries_in(f"{L}/l1_pipeline__{args.tag}.log", r"trunk gate total queries (\d+)")
     asm = re.findall(r"assembled net vs black box: max_eps ([\d.e+-]+) .*?mean per matrix \[(.*?)\]", open(f"{L}/refine_l1fixed__{args.tag}.log").read())
     if asm:
         means = [float(x.strip(" '")) for x in asm[-1][1].split(",")]
-        record("2a layer-1 isolation + scales (assembled, before refine)", float(asm[-1][0]), sum(means) / len(means), q_iso + q_sc)
+        record("2a layer-1 isolation + scales (assembled, before refine)", float(asm[-1][0]), sum(means) / len(means), q_iso + q_sc + q_orph + q_gate,
+               f"isolation {q_iso/1e6:.2f}M scales {q_sc/1e6:.2f}M orphans {q_orph/1e6:.2f}M gate {q_gate}")
     mx, mean = final_line(f"{L}/refine_l1fixed__{args.tag}.log")
     record(f"2b K-FAC refine, L1 frozen (cg {args.refine_cg} x {args.refine_iters})", mx, mean, queries_in(f"{L}/refine_l1fixed__{args.tag}.log", r"-> (\d+) queries"))
     base = f"{R}/_l1fixed_refined__{args.tag}.pt"

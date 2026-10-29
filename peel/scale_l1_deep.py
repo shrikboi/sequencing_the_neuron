@@ -119,4 +119,5 @@ for i, r in sorted(res.items()):
     print(f"neuron {i:3d} (teacher unit {j}): |w| true {wn_true:.6f} | tail fit {a_fit:.6f} (rel err {abs(a_fit/wn_true-1):.1e}) | plain log-linear {a_lin:.6f} (rel err {abs(a_lin/wn_true-1):.1e}) | line purity sv2/sv1 {purity:.0e} | sides {len(ests)} lines {tried} t {t:.0f} | {bb.n-q0} q", flush=True)
 torch.save(dict(results=out, dims=dims), out_path)
 errs = [abs(out[i]["scale"] / float(Wt[out[i]["teacher_unit"]].norm()) - 1) for i in out if out[i].get("scale")]
-print(f"DONE {len(errs)} scales | rel err median {sorted(errs)[len(errs)//2]:.1e} max {max(errs):.1e} | {time.time()-t0:.0f}s", flush=True)
+_es = f"rel err (scoring) median {sorted(errs)[len(errs)//2]:.1e} max {max(errs):.1e}" if errs else "no scales"
+print(f"DONE {len(errs)} scales | {_es} | total queries {bb.n} | {time.time()-t0:.0f}s", flush=True)
