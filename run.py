@@ -1367,6 +1367,19 @@ def main():
                          "canonicalizes the odd-symmetry polarity "
                          "tanh(-z) = -tanh(z) (sign flip, nothing absorbed). "
                          "No kinks: --verify / peel refiners are unavailable.")
+    ap.add_argument("--subspace", action="store_true",
+                    help="(MLP) low-rank first layer: measure rowspace(W1) from finite-difference "
+                         "output Jacobians (2*d queries per centre, counted), then run the committee "
+                         "on z = U^T x (arch k,h2,...; every query is the real black box at x = U z) "
+                         "and map back W1 = W1' U^T at the end (subspace.py). Final files/metrics are "
+                         "for the full net; intermediate files (pop, fast dumps) are in z-space. "
+                         "With large d, pass --disk-seg-gb scaled by k/d to keep rows per segment.")
+    ap.add_argument("--subspace-centers", type=int, default=3,
+                    help="--subspace: Jacobian centres (0 and N(0,1) points); 3 for fp64, 16 for fp32")
+    ap.add_argument("--subspace-eps", type=float, default=1e-4,
+                    help="--subspace: central-difference step (1e-4 fp64, 3e-2 fp32)")
+    ap.add_argument("--subspace-fp32", action="store_true",
+                    help="--subspace: measure with float32 black-box outputs (default float64)")
     ap.add_argument("--tanhsolver", action="store_true",
                     help="smooth-net (tanh/sigmoid) joint jet refiner "
                          "(tanh_solve.refine): after training, refine EVERY "
@@ -1495,6 +1508,11 @@ def main():
             ap.error('--normalized-peel requires a leaky-ReLU MLP; omit --peel-direct')
     if sum(bool(f) for f in (args.sigmoid, args.tanh, args.square, args.act)) > 1:
         ap.error("--sigmoid, --tanh, --square and --act are mutually exclusive")
+    if args.subspace and (args.conv or args.rnn or args.teacher_full or args.query_via_prefix
+                          or args.query_via_mlp_prefix or args.qg_init_data or args.query_map_abs
+                          or args.h_push or "datacov" in (args.qg_init, args.random_queries)
+                          or args.query_design == "kink"):
+        ap.error("--subspace needs a plain MLP black box queried in its own input space")
     if args.tanhsolver:
         if not (args.sigmoid or args.tanh or args.square or args.act):
             ap.error("--tanhsolver refines smooth nets only; add --tanh, --sigmoid, --square or --act")
@@ -1686,6 +1704,29 @@ def main():
                 eval_pts = _query_map(torch.randn(2000, 784, device=device) * 0.5)
             print("[setup] --query-via-prefix: queries = phi(x) through the exact LeNet conv1+conv2 (reachable set only); "
                   "disagreement optimised over pixels", flush=True)
+
+    if args.subspace:
+        import subspace as _ss
+        _ss_full_dims, _ss_full_teacher, _ss_full_eval = list(dims), teacher, eval_pts
+        _ss_k = teacher.layers[0].weight.shape[0]
+        if _ss_k >= dims[0]:
+            raise SystemExit(f"--subspace: first layer has {_ss_k} rows for {dims[0]} inputs, nothing to reduce")
+        _c = torch.randn(args.subspace_centers - 1, dims[0], generator=torch.Generator().manual_seed(12345))
+        _c = torch.cat([torch.zeros(1, dims[0]), _c]).to(device)
+        _ss_U, _s, _ss_q = _ss.measure(teacher, _ss_k, _c, args.subspace_eps,
+                                       torch.float32 if args.subspace_fp32 else torch.float64)
+        teacher, _eq = _ss.reduce(teacher, _ss_U)
+        dims = list(teacher.dims)
+        eval_pts = (eval_pts.double() @ _ss_U.to(eval_pts.device)).to(eval_pts.dtype)
+        _ss_info = {"k": _ss_k, "centers": args.subspace_centers, "eps": args.subspace_eps,
+                    "oracle": "fp32" if args.subspace_fp32 else "fp64", "queries": _ss_q,
+                    "sv_gap": (_s[_ss_k - 1] / _s[_ss_k]).item() if len(_s) > _ss_k else float("inf"),
+                    "reduced_vs_teacher_Uz": _eq,
+                    "eval_only_W1_outside_span": _ss.W1_outside(_ss_U, _ss_full_teacher)}
+        args.tag = "_".join(t for t in (args.tag, "sub" + ("fp32" if args.subspace_fp32 else "")) if t)
+        print(f"[subspace] rowspace(W1): {_ss_q} queries, gap s{_ss_k}/s{_ss_k + 1} {_ss_info['sv_gap']:.3g}, "
+              f"reduced arch {dims} (eval only: W1 outside span {_ss_info['eval_only_W1_outside_span']:.2e})",
+              flush=True)
 
     overrides = dict(VARIANTS[args.variant])
     if args.window is not None:
@@ -2259,12 +2300,27 @@ def main():
                  "final_agree": agreement(best.float(), teacher, eval_pts),
                  "queries": final.get("queries", 0) + _nq,
                  "wall_s": round(time.time() - t0, 1)}
+    if args.subspace:
+        # back to the full input space; everything below is the full net vs the full teacher
+        best = _ss.map_back(best, _ss_U, _ss_full_dims).to(device=device, dtype=next(best.parameters()).dtype)
+        teacher, dims, eval_pts = _ss_full_teacher, _ss_full_dims, _ss_full_eval
+        arch_tag = "x".join(map(str, dims))
+        _phase("mapped back to full input (W1 = W1' U^T)", best)
+        errs = param_errors(best, teacher, hard=args.hard)
+        final = {**final,
+                 "final_max_eps": errs["max_eps"],
+                 "final_mean_eps": sum(errs["mean_eps_per_matrix"]) / len(errs["mean_eps_per_matrix"]),
+                 "final_max_eps_per_matrix": errs["max_eps_per_matrix"],
+                 "final_agree": agreement(best.float(), teacher, eval_pts),
+                 "queries": final.get("queries", 0) + _ss_q,
+                 "subspace": _ss_info, "wall_s": round(time.time() - t0, 1)}
     os.makedirs(recon_dir, exist_ok=True)
     model_path = os.path.join(
         recon_dir, f"{args.variant}{tag}__{arch_tag}__s{args.seed}_final.pt")
     torch.save({"arch": dims, "act": act,
                 "state_dict": {k: v.detach().cpu()
                                for k, v in best.state_dict().items()},
+                **({"subspace_U": _ss_U.cpu()} if args.subspace else {}),
                 **final}, model_path)
     print(f"[save] {model_path}", flush=True)
     out = {
