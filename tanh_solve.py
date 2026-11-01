@@ -293,13 +293,16 @@ def _kfac_precond(theta, keys, freeze, X, act, n_layers, lam):
 
 def refine(bb, guess, X, act, dirs=0, iters=40, cg_iters=200, h=1e-3,
            jac_weight=1.0, seed=0, score=None, verbose=True, tag="[tanhsolver]",
-           precond=False, cg_tol=1e-3, freeze=()):
+           precond=False, cg_tol=1e-3, freeze=(), dir_basis=None):
     """Jointly refine every parameter of `guess` (MLP, any dtype) against the
     black box `bb` on query points X (N, d). Returns (net_fp64, info).
 
     dirs: 0 = full Jacobian (4*d queries/point); m>0 = m random directions per
     point (4*m queries/point). score: optional callable(net)->dict for
-    diagnostics only (e.g. lambda n: param_errors(n, teacher))."""
+    diagnostics only (e.g. lambda n: param_errors(n, teacher)).
+    dir_basis: optional (d, k) orthonormal basis; with dirs>0 the random probe directions are drawn
+    inside its span (Gaussian coefficients in the basis, then normalised) instead of the full space.
+    Used by --subspace-refine with the measured row space of W1 (every input-Jacobian row lies there)."""
     t0 = time.time()
     dev = X.device
     X = X.double()
@@ -308,7 +311,13 @@ def refine(bb, guess, X, act, dirs=0, iters=40, cg_iters=200, h=1e-3,
     n_layers = len(dims) - 1
     gen = torch.Generator(device="cpu").manual_seed(seed)
     if dirs and dirs < d:
-        U = torch.randn(N, dirs, d, generator=gen, dtype=torch.float64).to(dev)
+        if dir_basis is not None:
+            Bs = dir_basis.detach().to(device="cpu", dtype=torch.float64)          # (d, k)
+            if Bs.shape[0] != d:
+                raise ValueError(f"dir_basis has {Bs.shape[0]} rows for input dim {d}")
+            U = (torch.randn(N, dirs, Bs.shape[1], generator=gen, dtype=torch.float64) @ Bs.T).to(dev)
+        else:
+            U = torch.randn(N, dirs, d, generator=gen, dtype=torch.float64).to(dev)
         U = U / U.norm(dim=2, keepdim=True)
     else:
         U, dirs = None, d
@@ -318,7 +327,8 @@ def refine(bb, guess, X, act, dirs=0, iters=40, cg_iters=200, h=1e-3,
     Y, JU = measure_jets(oracle, X, U, h=h)
     n_meas = oracle.n - q0
     if verbose:
-        print(f"{tag} jets: {N} points x {dirs} dirs -> {n_meas} queries "
+        print(f"{tag} jets: {N} points x {dirs} dirs"
+              f"{f' (in span of a {dir_basis.shape[1]}-dim basis)' if dir_basis is not None and U is not None else ''} -> {n_meas} queries "
               f"({time.time() - t0:.1f}s); residual rows {N * Y.shape[1] * (1 + dirs)}",
               flush=True)
 
@@ -345,10 +355,15 @@ def refine(bb, guess, X, act, dirs=0, iters=40, cg_iters=200, h=1e-3,
         return torch.cat([dct[k].reshape(-1) for k in keys])
 
     def unflat(v):
-        out, i = {k: torch.zeros_like(theta[k]) for k in freeze}, 0     # frozen: zero tangent / zero step
-        for k in keys:
-            n = theta[k].numel()
-            out[k] = v[i:i + n].view_as(theta[k]); i += n
+        # keys in theta's own order (jvp needs tangents with the same dict structure as theta); frozen: zero tangent / zero
+        # step. (Frozen-first order only matched theta when the one frozen tensor was layers.0.weight.)
+        out, i = {}, 0
+        for k in theta:
+            if k in freeze:
+                out[k] = torch.zeros_like(theta[k])
+            else:
+                n = theta[k].numel()
+                out[k] = v[i:i + n].view_as(theta[k]); i += n
         return out
 
     def describe(p, label):

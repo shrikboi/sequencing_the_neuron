@@ -2315,6 +2315,18 @@ def main():
                  "queries": final.get("queries", 0) + _ss_q,
                  "subspace": _ss_info, "wall_s": round(time.time() - t0, 1)}
     os.makedirs(recon_dir, exist_ok=True)
+    if args.subspace and cfg.pop_save_path and os.path.exists(cfg.pop_save_path):
+        # the periodic population snapshot lives in the reduced (k-dim input) space; save a mapped-back copy under the
+        # full-arch name (members W1 = W1' U^T, full teacher) so solve_tanh.py's later stages can use a --subspace committee
+        _pck = torch.load(cfg.pop_save_path, map_location="cpu", weights_only=False)
+        _Ut = _ss_U.detach().cpu().double().T
+        def _mb(sd):
+            sd = dict(sd); w = sd["layers.0.weight"]; sd["layers.0.weight"] = (w.double() @ _Ut).to(w.dtype); return sd
+        _full_pop = os.path.join(recon_dir, f"_pop__{args.variant}{tag}__{arch_tag}__s{args.seed}.pt")
+        torch.save({**_pck, "dims": list(dims), "pop_states": [_mb(sd) for sd in _pck["pop_states"]],
+                    "teacher_state": {k: v.detach().cpu() for k, v in teacher.state_dict().items()},
+                    "subspace_U": _ss_U.cpu(), "mapped_back_from": cfg.pop_save_path}, _full_pop)
+        print(f"[subspace] population snapshot (it {_pck.get('iter')}) mapped back to the full input -> {_full_pop}", flush=True)
     model_path = os.path.join(
         recon_dir, f"{args.variant}{tag}__{arch_tag}__s{args.seed}_final.pt")
     torch.save({"arch": dims, "act": act,

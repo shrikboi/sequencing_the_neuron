@@ -11,6 +11,10 @@ Stages (each skippable / resumable):
                   tail-decay scales + assemble + K-FAC refine (layer 1 frozen)   [--refine-cg/--refine-iters]
   3 polish        peel/polish_full.py, K-FAC, layer 1 frozen, bigger CG budget   [--polish-cg/--polish-iters]
   4 final         peel/polish_full.py, K-FAC, everything free                     [--final-cg/--final-iters]
+--subspace         run the committee on the measured row space of W1 (run.py --subspace).
+--subspace-refine  draw the refiner's probe directions inside that row space in every refinement stage (2b, 3, 4),
+                   then add stage 4b: the same polish with full-space directions and only layer 1 free (layers 2.. frozen).
+                   U comes from a --subspace committee (no extra queries) or is measured here (counted).
 Shallow nets (committee already has layer 1: its W1 max eps < --l1-threshold) skip stages 2-3.
 --skip-committee reuses an existing run's files (same --tag). Summary table at the end."""
 import argparse, json, os, re, subprocess, sys, time
@@ -40,10 +44,18 @@ ap.add_argument("--keep-ring", action="store_true", help="keep the --disk replay
 ap.add_argument("--trunk", choices=["consensus", "best", "consensus-nol1"], default="consensus",
                 help="solver starting net: aligned quorum-consensus net (default), the best member, or consensus-nol1 = consensus "
                      "net WITHOUT the layer-1 order check on the deep path (layer 1 is rebuilt there); the shallow path then uses the best member")
+ap.add_argument("--subspace", action="store_true", help="committee on the measured first-layer subspace (passes --subspace to run.py)")
+ap.add_argument("--subspace-centers", type=int, default=16,
+                help="Jacobian centres for measuring the subspace (run.py's committee measurement, or --subspace-refine's if the committee "
+                     "did not use --subspace); 16 needed at depth (9 hidden: 3 left W1 2e-3 outside the measured span)")
+ap.add_argument("--subspace-fp32", action="store_true", help="measure the subspace with float32 outputs (passes --subspace-fp32)")
+ap.add_argument("--subspace-refine", action="store_true",
+                help="refinement stages draw their probe directions inside span(U), then a final full-space stage with only layer 1 free")
 args = ap.parse_args()
 dims = [int(x) for x in args.arch.split(",")]; arch = "x".join(map(str, dims))
 gpus = args.gpus.split(","); g0 = gpus[0]
-name = f"{args.variant}_tanh_{args.tag}__{arch}__s{args.seed}"
+ctag = "_".join([args.tag] + (["sub" + ("fp32" if args.subspace_fp32 else "")] if args.subspace else []))   # run.py appends _sub
+name = f"{args.variant}_tanh_{ctag}__{arch}__s{args.seed}"
 R, L = "recon", "results/logs"; os.makedirs(L, exist_ok=True)
 pop_path, final_path = f"{R}/_pop__{name}.pt", f"{R}/{name}_final.pt"
 stages = []; q_total = 0; t_start = time.time()
@@ -91,6 +103,8 @@ if not args.skip_committee:
     if args.qg_block_gb: cmd += f" --qg-block-gb {args.qg_block_gb}"
     if args.qg_chunk_gb: cmd += f" --qg-chunk-gb {args.qg_chunk_gb}"
     if args.qg_tf32: cmd += " --qg-tf32"
+    if args.subspace:
+        cmd += f" --subspace --subspace-centers {args.subspace_centers}" + (" --subspace-fp32 --subspace-eps 3e-2" if args.subspace_fp32 else "")
     cmd += f" {args.extra}"
     sh(cmd, f"{L}/committee__{args.tag}.log")
 res = json.load(open(f"results/{name}.json"))
@@ -100,6 +114,29 @@ if args.disk and not args.keep_ring and os.path.isdir(args.disk) and os.path.abs
 w1_max = max(res["final_max_eps_per_matrix"][:2])
 record("1 committee", res["final_max_eps"], res["final_mean_eps"], int(res["queries"]),
        f"certified {res['log'][-1].get('n_consensus')}/{res['log'][-1].get('n_total')} | W1 max {w1_max:.2e} | per-matrix max {' '.join(f'{x:.1e}' for x in res['final_max_eps_per_matrix'])}")
+
+# ---------------------------------------------------------------- 1c. subspace for the refinement stages
+SUBENV = ""
+if args.subspace_refine:
+    import torch
+    _uf = f"{R}/_subspaceU__{args.tag}.pt"
+    _fin = torch.load(final_path, map_location="cpu", weights_only=False)
+    if "subspace_U" in _fin:
+        torch.save({"U": _fin["subspace_U"].double()}, _uf)
+        say(f"--subspace-refine: U ({tuple(_fin['subspace_U'].shape)}) from the --subspace committee, no extra queries -> {_uf}")
+    else:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import subspace as _ss
+        from nets import MLP
+        _pk = torch.load(pop_path, map_location="cpu", weights_only=False)
+        _T = MLP(dims, act="tanh"); _T.load_state_dict(_pk["teacher_state"])      # the black box, queried below (counted)
+        _dev = "cuda" if torch.cuda.is_available() else "cpu"; _T = _T.to(_dev)
+        _c = torch.cat([torch.zeros(1, dims[0]), torch.randn(args.subspace_centers - 1, dims[0], generator=torch.Generator().manual_seed(12345))]).to(_dev)
+        _U, _s, _q = _ss.measure(_T, dims[1], _c, 3e-2 if args.subspace_fp32 else 1e-4, torch.float32 if args.subspace_fp32 else torch.float64)
+        torch.save({"U": _U.cpu()}, _uf)
+        record("1c subspace measurement for the refinement", res["final_max_eps"], res["final_mean_eps"], int(_q),
+               f"{args.subspace_centers} centres, gap s{dims[1]}/s{dims[1] + 1} {(_s[dims[1] - 1] / _s[dims[1]]).item() if len(_s) > dims[1] else float('inf'):.3g}")
+    SUBENV = f"SUBSPACE_U={_uf} "
 
 # ---------------------------------------------------------------- 2. layer-1 pipeline + frozen refine
 _cl = (res["log"][-1].get("consensus_eps_per_layer") or [{}])[0] if res.get("log") else {}
@@ -127,7 +164,7 @@ if shallow:
     torch.save({"dims": dims, "act": "tanh", "teacher_state": pop["teacher_state"], "state_dict": _cs if _cs is not None else fin["state_dict"]}, guess)
     base = guess
 else:
-    sh(f"TRUNK={args.trunk} L1_GATE={'blackbox' if args.l1_gate == 'consensus' else 'oracle'} {P} peel/diag/l1_pipeline.py {args.tag} {pop_path} {final_path} {args.gpus} {args.refine_cg} {args.refine_iters}", f"{L}/l1_pipeline__{args.tag}.log")
+    sh(f"{SUBENV}TRUNK={args.trunk} L1_GATE={'blackbox' if args.l1_gate == 'consensus' else 'oracle'} {P} peel/diag/l1_pipeline.py {args.tag} {pop_path} {final_path} {args.gpus} {args.refine_cg} {args.refine_iters}", f"{L}/l1_pipeline__{args.tag}.log")
     guess = f"{R}/_guess__{args.tag}.pt"
     # every stage prints its oracle's total ("total queries N"): isolation shards + gap-fills + orphan re-isolations,
     # scale shards + orphan scales (incl. their row-space jets), orphan searches, and the trunk gate
@@ -141,23 +178,33 @@ else:
         record("2a layer-1 isolation + scales (assembled, before refine)", float(asm[-1][0]), sum(means) / len(means), q_iso + q_sc + q_orph + q_gate,
                f"isolation {q_iso/1e6:.2f}M scales {q_sc/1e6:.2f}M orphans {q_orph/1e6:.2f}M gate {q_gate}")
     mx, mean = final_line(f"{L}/refine_l1fixed__{args.tag}.log")
-    record(f"2b K-FAC refine, L1 frozen (cg {args.refine_cg} x {args.refine_iters})", mx, mean, queries_in(f"{L}/refine_l1fixed__{args.tag}.log", r"-> (\d+) queries"))
+    record(f"2b K-FAC refine, L1 frozen{', subspace dirs' if SUBENV else ''} (cg {args.refine_cg} x {args.refine_iters})", mx, mean, queries_in(f"{L}/refine_l1fixed__{args.tag}.log", r"-> (\d+) queries"))
     base = f"{R}/_l1fixed_refined__{args.tag}.pt"
     # 3. frozen polish with the bigger budget
     if args.polish_iters > 0:
         out = f"{R}/_polished__{args.tag}.pt"
-        sh(f"FREEZE=layers.0.weight PRECOND=kfac CUDA_VISIBLE_DEVICES={g0} {P} peel/polish_full.py {guess} {base} {out} {args.points} {args.dirs} {args.polish_iters} {args.polish_cg}", f"{L}/polish__{args.tag}.log")
+        sh(f"{SUBENV}FREEZE=layers.0.weight PRECOND=kfac CUDA_VISIBLE_DEVICES={g0} {P} peel/polish_full.py {guess} {base} {out} {args.points} {args.dirs} {args.polish_iters} {args.polish_cg}", f"{L}/polish__{args.tag}.log")
         mx, mean = final_line(f"{L}/polish__{args.tag}.log")
-        record(f"3 K-FAC polish, L1 frozen (cg {args.polish_cg} x {args.polish_iters})", mx, mean, queries_in(f"{L}/polish__{args.tag}.log", r"-> (\d+) queries"))
+        record(f"3 K-FAC polish, L1 frozen{', subspace dirs' if SUBENV else ''} (cg {args.polish_cg} x {args.polish_iters})", mx, mean, queries_in(f"{L}/polish__{args.tag}.log", r"-> (\d+) queries"))
         base = out
 
 # ---------------------------------------------------------------- 4. final polish, everything free
 if args.final_iters > 0:
-    out = f"{R}/_final__{args.tag}.pt"
-    sh(f"PRECOND=kfac CUDA_VISIBLE_DEVICES={g0} {P} peel/polish_full.py {guess} {base} {out} {args.points} {args.dirs} {args.final_iters} {args.final_cg}", f"{L}/final__{args.tag}.log")
-    mx, mean = final_line(f"{L}/final__{args.tag}.log")
-    record(f"4 K-FAC final polish, all free (cg {args.final_cg} x {args.final_iters})", mx, mean, queries_in(f"{L}/final__{args.tag}.log", r"-> (\d+) queries"))
+    out = f"{R}/_final{'_sub' if SUBENV else ''}__{args.tag}.pt"
+    lg = f"{L}/final{'_sub' if SUBENV else ''}__{args.tag}.log"
+    sh(f"{SUBENV}PRECOND=kfac CUDA_VISIBLE_DEVICES={g0} {P} peel/polish_full.py {guess} {base} {out} {args.points} {args.dirs} {args.final_iters} {args.final_cg}", lg)
+    mx, mean = final_line(lg)
+    record(f"4 K-FAC final polish, all free{', subspace dirs' if SUBENV else ''} (cg {args.final_cg} x {args.final_iters})", mx, mean, queries_in(lg, r"-> (\d+) queries"))
     base = out
+    if SUBENV:
+        # 4b: directions inside span(U) leave the first layer's biases (and its weights' out-of-span part) poorly determined
+        # (5 hidden: b1 stuck at 5.6e-5 while layers 2-6 reached 1e-7). Same polish, full-space directions, only layer 1 free.
+        out = f"{R}/_final__{args.tag}.pt"
+        frz = ",".join(f"layers.{i}.{p}" for i in range(1, len(dims) - 1) for p in ("weight", "bias"))
+        sh(f"FREEZE={frz} PRECOND=kfac CUDA_VISIBLE_DEVICES={g0} {P} peel/polish_full.py {guess} {base} {out} {args.points} {args.dirs} {args.final_iters} {args.final_cg}", f"{L}/final__{args.tag}.log")
+        mx, mean = final_line(f"{L}/final__{args.tag}.log")
+        record(f"4b K-FAC polish, layer 1 only, full-space dirs (cg {args.final_cg} x {args.final_iters})", mx, mean, queries_in(f"{L}/final__{args.tag}.log", r"-> (\d+) queries"))
+        base = out
 
 print("\n" + "=" * 100)
 print(f"SUMMARY {name}  ({(time.time()-t_start)/3600:.2f} h)")
