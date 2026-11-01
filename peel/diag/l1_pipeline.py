@@ -47,8 +47,10 @@ guess = f"{R}/_guess__{tag}.pt"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from consensus_guess import consensus_guess
 _cs = None
-if os.environ.get("TRUNK", "consensus") == "consensus":
-    _cs, _ = consensus_guess(pop, fin["state_dict"])
+_TRUNK = os.environ.get("TRUNK", "consensus")
+assert _TRUNK in ("consensus", "best", "consensus-nol1"), _TRUNK
+if _TRUNK in ("consensus", "consensus-nol1"):
+    _cs, _ = consensus_guess(pop, fin["state_dict"], check_l1=(_TRUNK == "consensus"))
     print("[pipeline] trunk gate total queries 4096", flush=True)      # consensus_guess's black-box sanity gate (upper bound)
 torch.save({"dims": dims, "act": "tanh", "teacher_state": pop["teacher_state"],
             "state_dict": _cs if _cs is not None else fin["state_dict"],
@@ -80,7 +82,9 @@ score_gate(res, bad)
 # 2. gap-fill the failures from other members' guesses. Members have DIFFERENT unit orders: pair the
 #    failed best-member unit i to member m's unit j by max |cos| of the W1 rows, isolate j with member m's
 #    guess, and accept only if the result still points along the best member's row (|cos| > 0.9).
-g0 = fin["state_dict"]["layers.0.weight"].double(); g0n = g0 / g0.norm(dim=1, keepdim=True)
+# pair failed units by the STARTING net's own layer-1 rows (the guess the isolation used), not the best member's: with
+# TRUNK=consensus-nol1 the two can differ in a few rows
+g0 = (_cs if _cs is not None else fin["state_dict"])["layers.0.weight"].double(); g0n = g0 / g0.norm(dim=1, keepdim=True)
 for m in range(1, len(members)):
     if not bad: break
     Wm = pop["pop_states"][m]["layers.0.weight"].double(); Wmn = Wm / Wm.norm(dim=1, keepdim=True)

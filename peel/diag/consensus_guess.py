@@ -25,7 +25,8 @@ from align import param_errors
 
 
 @torch.no_grad()
-def consensus_guess(pop_ckpt, best_state, eps=0.02, quorum=0.625, act="tanh", min_cos=0.99, max_mae_ratio=3.0, bb=None, verbose=True):
+def consensus_guess(pop_ckpt, best_state, eps=0.02, quorum=0.625, act="tanh", min_cos=0.99, max_mae_ratio=3.0, bb=None, verbose=True,
+                    check_l1=True):
     """pop_ckpt: dict with dims / pop_states / teacher_state (a _pop__ snapshot). best_state: the best member's
     state_dict (the final checkpoint). bb: black-box callable X -> Y for the sanity gate (default: the teacher in
     pop_ckpt, i.e. the same oracle the run queried; costs 4096 queries). Returns (state_dict or None, note)."""
@@ -49,6 +50,11 @@ def consensus_guess(pop_ckpt, best_state, eps=0.02, quorum=0.625, act="tanh", mi
         pb = param_errors(best, T)["max_eps_per_matrix"]; pc = param_errors(cnet, T)["max_eps_per_matrix"]
         note += ("\n  best member per-matrix max (teacher, scoring only): " + " ".join(f"{float(x):.1e}" for x in pb)
                  + "\n  consensus   per-matrix max (teacher, scoring only): " + " ".join(f"{float(x):.1e}" for x in pc))
+    if n_bad and not check_l1:
+        # deep path (TRUNK=consensus-nol1): layer 1 is replaced by isolation, and l1_pipeline pairs units against the
+        # starting net's OWN layer 1, so a layer-1 order mismatch with the best member does not break anything downstream
+        note += f"\n  -> order check skipped ({n_bad} rows differ; layer 1 is rebuilt by isolation)"
+        n_bad = 0
     if n_bad:
         note += "\n  -> order check FAILED: keeping the best member"
         if verbose: print(note, flush=True)

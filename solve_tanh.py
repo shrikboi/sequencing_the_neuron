@@ -37,7 +37,9 @@ ap.add_argument("--polish-cg", type=int, default=4000); ap.add_argument("--polis
 ap.add_argument("--final-cg", type=int, default=4000); ap.add_argument("--final-iters", type=int, default=6)
 ap.add_argument("--points", type=int, default=512); ap.add_argument("--dirs", type=int, default=64)
 ap.add_argument("--keep-ring", action="store_true", help="keep the --disk replay ring after the committee (default: delete it, it is not used by the later stages)")
-ap.add_argument("--trunk", choices=["consensus", "best"], default="consensus", help="solver starting net: aligned quorum-consensus net (default) or the best member")
+ap.add_argument("--trunk", choices=["consensus", "best", "consensus-nol1"], default="consensus",
+                help="solver starting net: aligned quorum-consensus net (default), the best member, or consensus-nol1 = consensus "
+                     "net WITHOUT the layer-1 order check on the deep path (layer 1 is rebuilt there); the shallow path then uses the best member")
 args = ap.parse_args()
 dims = [int(x) for x in args.arch.split(",")]; arch = "x".join(map(str, dims))
 gpus = args.gpus.split(","); g0 = gpus[0]
