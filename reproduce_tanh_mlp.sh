@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproduce the deep tanh MLP recoveries (results/RECORD_tanh_demo_campaign_2026-10-16.md), one depth per call.
-#   bash reproduce_tanh_mlp.sh DEPTH [GPU] [TAG]          DEPTH in 5L 6L 8L 9L 10L
+#   bash reproduce_tanh_mlp.sh DEPTH [GPU] [TAG]          DEPTH in 5L 6L 8L 9L 10L 11L 12L 13L 14L
 # Teacher seed 0, input 3072, hidden width 200, output 100 ("8L" = 8 layers incl. input and output = 6 hidden).
 # Pipeline (solve_tanh.py): committee -> layer-1 isolation + tail-decay scales (deep nets only) -> K-FAC jet refine
 # (layer 1 frozen) -> K-FAC polish (frozen) -> K-FAC final polish (all free).  5L/6L also get the extra 8-step
@@ -9,6 +9,21 @@
 #   6L  3.9e-8  / 1.4e-9    3.24M    ~1.5 h        9L   1.7e-6 / 3.4e-8   182.9M   ~14 h
 #                                                  10L  2.9e-6 / 6.2e-8   181.5M   ~14 h
 # 8L-10L use the --disk replay ring: free disk needed ~130 GB (8L), ~240 GB (9L), ~330 GB (10L) under rings/.
+#
+# 11L-14L: the --subspace pipeline. The committee runs on the measured row space of W1 (16 Jacobian centres,
+# 98,304 queries; run.py --subspace), window 20, 40 rounds, 5 epochs; the refinement stages draw their directions in
+# that subspace (--subspace-refine), with a final layer-1-only stage in the full input space. Black-box layer-1 gate
+# (--l1-gate consensus); starting net = the best member (--trunk consensus-nol1: on these depths the committee solves
+# layer 1, so the shallow path runs, without isolation/scales). Then an extra polish of the solved net:
+#   A: all free, subspace directions, 8 K-FAC steps (cg 4000)      B: layer 1 only, full-space directions, 4 steps (cg 4000)
+# (+131,584 queries each). Results (L40S, seed 0; committee | after the extra polish, max / mean eps, total queries):
+#   11L  q  450k/round   committee 1.86e-4 / 2.17e-5   final 5.81e-5 / 1.47e-6   18.62M   (~1.7 h + 1.2 h + 1.3 h)
+#   12L  q  600k/round   committee 2.50e-4 / 2.43e-5   final 7.96e-5 / 4.59e-6   24.62M   (~2.3 h + 1.3 h + 1.4 h)
+#   13L  q  800k/round   committee 2.51e-4 / 2.70e-5   final 9.26e-5 / 8.65e-6   32.62M   (~3.3 h + 1.3 h + 1.5 h)
+#   14L  q 1000k/round   committee 3.50e-4 / 3.27e-5   final 2.14e-4 / 1.66e-5   40.62M   (~4.3 h + 1.4 h + 2.0 h)
+# Queries = committee (rounds x q + 98,304) + 4 x 131,584 (solve: subspace polish + layer-1 polish; extra polish A + B).
+# The committee keeps its query window in RAM (~6-24 GB host memory); at the end run.py writes the window to
+# recon/mergedbest512_tanh_<TAG>_sub__200x...pt (11-29 GB). Nothing later reads it, so this script deletes it.
 # GPU runs are not bit-reproducible: expect numbers close to, not equal to, the record.
 set -euo pipefail
 DEPTH="${1:?usage: reproduce_tanh_mlp.sh DEPTH [GPU] [TAG]}"; GPU="${2:-0}"; TAG="${3:-repro_$DEPTH}"
@@ -17,13 +32,23 @@ mkdir -p results/logs recon rings
 S="--refine-cg 2000 --refine-iters 8 --polish-cg 2000 --polish-iters 6 --final-cg 2000 --final-iters 4"
 DISK="--disk rings/$TAG --disk-ram-gb 50"
 BIG="--window 20 --epochs 5 $DISK --qg-block-gb 1.61 --qg-chunk-gb 6.5"
+SUB="--window 20 --outer 40 --epochs 5 --subspace --subspace-centers 16 --subspace-refine --l1-gate consensus --trunk consensus-nol1"
+SUBDEPTH=0
 case "$DEPTH" in
   5L)  ARCH=3072,200,200,200,100;                         OPTS="--q 48000 --window 30" ;;
   6L)  ARCH=3072,200,200,200,200,100;                     OPTS="--q 96000 --window 30" ;;
   8L)  ARCH=3072,200,200,200,200,200,200,100;             OPTS="--q 300000 --window 30 $DISK" ;;
   9L)  ARCH=3072,200,200,200,200,200,200,200,100;         OPTS="--q 1200000 $BIG" ;;
   10L) ARCH=3072,200,200,200,200,200,200,200,200,100;     OPTS="--q 1200000 $BIG" ;;
-  *) echo "unknown depth $DEPTH (5L 6L 8L 9L 10L)"; exit 1 ;;
+  11L) Q=450000 ;;
+  12L) Q=600000 ;;
+  13L) Q=800000 ;;
+  14L) Q=1000000 ;;
+  *) echo "unknown depth $DEPTH (5L 6L 8L 9L 10L 11L 12L 13L 14L)"; exit 1 ;;
+esac
+case "$DEPTH" in
+  11L|12L|13L|14L)
+    SUBDEPTH=1; NH=$(( ${DEPTH%L} - 2 )); ARCH="3072$(printf ',200%.0s' $(seq $NH)),100"; OPTS="--q $Q $SUB" ;;
 esac
 LOG="results/logs/solve_tanh__$TAG.log"
 echo "== $DEPTH: arch $ARCH, GPU $GPU, tag $TAG (log $LOG)"
@@ -36,5 +61,21 @@ if [ "$DEPTH" = "5L" ] || [ "$DEPTH" = "6L" ]; then
   echo "== extra all-free polish -> recon/_final2__$TAG.pt (log results/logs/final2__$TAG.log)"
   PRECOND=kfac CUDA_VISIBLE_DEVICES="$GPU" python -u peel/polish_full.py "$POP" "recon/_final__$TAG.pt" \
     "recon/_final2__$TAG.pt" 512 64 8 2000 2>&1 | tee "results/logs/final2__$TAG.log" | grep -E "before:|after:"
+fi
+
+if [ "$SUBDEPTH" = 1 ]; then
+  rm -f recon/mergedbest512_tanh_${TAG}_sub__200x*__s0.pt       # the committee's query-window dump (not used below)
+  # extra polish of the solved net (recon/_final__$TAG.pt); recon/_guess__$TAG.pt only supplies the black box
+  NL=$(( ${DEPTH%L} - 1 ))
+  FRZ=$(python -c "print(','.join(f'layers.{i}.{p}' for i in range(1, $NL) for p in ('weight', 'bias')))")
+  echo "== extra polish A: all free, subspace directions, 8 steps -> recon/_xpol_sub__$TAG.pt (log results/logs/xpol_sub__$TAG.log)"
+  SUBSPACE_U="recon/_subspaceU__$TAG.pt" PRECOND=kfac CUDA_VISIBLE_DEVICES="$GPU" python -u peel/polish_full.py \
+    "recon/_guess__$TAG.pt" "recon/_final__$TAG.pt" "recon/_xpol_sub__$TAG.pt" 512 64 8 4000 \
+    2>&1 | tee "results/logs/xpol_sub__$TAG.log" | grep -E "before:|after:" | sed 's/| mean per-matrix.*//'
+  echo "== extra polish B: layer 1 only, full-space directions, 4 steps -> recon/_xpol__$TAG.pt (log results/logs/xpol__$TAG.log)"
+  FREEZE="$FRZ" PRECOND=kfac CUDA_VISIBLE_DEVICES="$GPU" python -u peel/polish_full.py \
+    "recon/_guess__$TAG.pt" "recon/_xpol_sub__$TAG.pt" "recon/_xpol__$TAG.pt" 512 64 4 4000 \
+    2>&1 | tee "results/logs/xpol__$TAG.log" | grep -E "after:" | sed 's/frozen=([^)]*)/frozen=(L2..)/; s/| mean per-matrix.*//'
+  echo "== final net: recon/_xpol__$TAG.pt"
 fi
 echo "== done ($DEPTH)"
