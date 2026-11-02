@@ -231,8 +231,11 @@ def recover_layer(teacher, cons, frontier, device, only_channels=None, gen=None,
         # gap ~ the prefix error (1e-13 exact prefix, ~1e-6 for a 1e-8 prefix as in
         # the real pipeline), so the thresholds are set between, NOT at the exact-
         # prefix floor (1e-7 / 1e-9 rejected every channel of the real checkpoint).
+        # unc_gate / gap_gate (kwargs, defaults = the original 1e-5 / 1e-4): deep layers on a slightly inexact prefix
+        # give correct solves with uncertainty ~ the prefix error (1e-5 at L8 on a 7e-6 prefix); wrong locks are ~1e-2
         ok = (int(inlier.sum()) >= W.shape[1]+8 and valid_fraction >= .9
-              and angle <= angle_gate and gap < 1e-4 and uncertainty < 1e-5)
+              and angle <= angle_gate and gap < kwargs.get('gap_gate', 1e-4)
+              and uncertainty < kwargs.get('unc_gate', 1e-5))
         if diagnostics is not None:
             diagnostics[c] = dict(points=len(H), round_budget=max_rounds, cond=cond, gap=gap,
                                   uncertainty=uncertainty, validation_fraction=valid_fraction, angle=angle,

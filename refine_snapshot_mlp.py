@@ -45,6 +45,20 @@ ap.add_argument("--orphan-gauge", choices=["guess", "net"], default="guess",
                 help="committee orphan rows for unsolved units: 'guess' = members aligned to the original guess member (default, "
                      "as before); 'net' = members' rows mapped onto the REFINED prefix by activation matching (a broken unit in "
                      "the guess member scrambles the 'guess' alignment; see member_rows_netgauge)")
+ap.add_argument("--design-from", type=int, default=0,
+                help="1-indexed hidden layer from which every row is solved with the design sampler (as layer 1) instead of "
+                     "surface tracking: ~2x precision loss per layer instead of ~10-20x, at more queries (0 = off, tracking)")
+ap.add_argument("--design-need", type=int, default=0,
+                help="--design-from layers: kink points per unit for the design fit (0 = method.py's default max(400, 2*Din)); "
+                     "the sampler raises it to its own minimum max(Din+48, 7/6 (Din+16))")
+ap.add_argument("--reanchor", action="store_true",
+                help="before refining layer l >= 2: rewrite the ORIGINAL guess member's layer-l rows over the refined layer-(l-1) "
+                     "units, matched by activation on random inputs (no queries). Without it, layer l's guess still weights the "
+                     "guess member's own layer-(l-1) units, which no longer match where rows were replaced (committee orphans, "
+                     "duplicates): 13 replaced L4 units left the L5 guess 15 deg off (0.12 deg after re-anchoring)")
+ap.add_argument("--design-unc-gate", type=float, default=0.0,
+                help="--design-from layers: accept a design fit with uncertainty below this (sampler default 1e-5; 0 = default). "
+                     "Correct deep solves sit at ~the prefix error, wrong locks at ~1e-2")
 ap.add_argument("--member", default="consensus", help="guess member: 'consensus' (teacher-free vote) or an index")
 a = ap.parse_args(); dev = a.device
 d = torch.load(a.snapshot, map_location=dev, weights_only=False)
@@ -79,6 +93,7 @@ for p in net.parameters():
 print(f"[refine] guess = member {bi} of {len(mems)} | dims {dims} | start max_eps {param_errors(net, T)['max_eps']:.2e}", flush=True)
 
 guess0 = copy.deepcopy(net)        # --dup-check: the guess member's original rows
+anchored = {}                      # --reanchor: layer -> (W, b) guess rows over the refined prefix
 
 # committee copies in a common (scale-normalised) gauge, for the fallback guesses
 with torch.no_grad():
@@ -101,7 +116,8 @@ def orphans(l, Wr, br, ok, cos=0.99):
     pool = []
     for k, m in enumerate([nz] + alt):
         R = rows(m, l)
-        pool += [(r, k) for r in R[(R @ Rr.T).abs().amax(1) < cos]]
+        mc = (R @ Rr.T).abs().amax(1) if len(Rr) else torch.zeros(len(R), device=R.device, dtype=R.dtype)
+        pool += [(r, k) for r in R[mc < cos]]
     out, used = [], [False] * len(pool)
     for i, (ri, _) in enumerate(pool):
         if used[i]:
@@ -250,7 +266,7 @@ def orphans_net(l, ok, cos=0.98):
     S = S / S.norm(dim=1, keepdim=True)
     pool = []
     for Rm, k_ in member_rows_netgauge(l):
-        mc = (Rm @ S.T).abs().amax(1)
+        mc = (Rm @ S.T).abs().amax(1) if len(S) else torch.zeros(len(Rm), device=Rm.device, dtype=Rm.dtype)
         pool += [(Rm[j], k_, float(mc[j])) for j in (mc < cos).nonzero().flatten().tolist()]
     out, used = [], [False] * len(pool)
     for i, (ri, _, _) in enumerate(pool):
@@ -263,6 +279,63 @@ def orphans_net(l, ok, cos=0.98):
         cen = max(g, key=lambda k: sum(float(pool[k][0] @ pool[q][0]) for q in g))
         out.append((support, pool[cen][2], pool[cen][0]))
     return [(sup, r) for sup, _, r in sorted(out, key=lambda t: (-t[0], t[1]))]
+
+
+def reanchor(l, n_pts=8192):
+    """--reanchor: net.layers[l] <- guess0's layer-l rows written over net's (refined) layer-(l-1) units (no queries)"""
+    X = torch.randn(n_pts, dims[0], device=dev, dtype=torch.float64,
+                    generator=torch.Generator(device=dev).manual_seed(91 + l)) * 0.5
+    def h(n):
+        H = X
+        for i in range(l):
+            H = n.act(n.layers[i](H))
+        return H
+    Hn, Hg = h(net), h(guess0)
+    zs = lambda H: (H - H.mean(0)) / (H - H.mean(0)).norm(dim=0).clamp_min(1e-300)
+    C = zs(Hg).T @ zs(Hn)
+    corr, kk = C.max(1)
+    sc = (Hg * Hn[:, kk]).sum(0) / (Hn[:, kk] ** 2).sum(0).clamp_min(1e-300)
+    W = torch.zeros(dims[l + 1], dims[l], device=dev, dtype=torch.float64)
+    W.index_add_(1, kk, guess0.layers[l].weight.double() * sc[None])
+    # columns the guess member cannot supply: refined units it has no unit for, or two (a duplicate standing in for
+    # a missing unit -> its outgoing weights compensate on the copy). Fill them from the other members (each mapped
+    # onto the refined units the same way), median over members of each guess row's best-matching member row.
+    cnt = torch.bincount(kk, minlength=dims[l])
+    S = (cnt != 1).nonzero().flatten()
+    if len(S):
+        keep = (cnt == 1)
+        Gk = W[:, keep] / W[:, keep].norm(dim=1, keepdim=True).clamp_min(1e-300)
+        vals, ok_cols = [], []
+        for k_, m in enumerate(mems):
+            if k_ == bi:
+                continue
+            Hm = h(m); cm, km = (zs(Hm).T @ zs(Hn)).max(1)
+            okc = torch.bincount(km, minlength=dims[l])[S] == 1      # columns of S this member supplies cleanly
+            if not bool(okc.any()):
+                continue
+            sm = (Hm * Hn[:, km]).sum(0) / (Hn[:, km] ** 2).sum(0).clamp_min(1e-300)
+            Wm = torch.zeros(m.layers[l].weight.shape[0], dims[l], device=dev, dtype=torch.float64)
+            Wm.index_add_(1, km, m.layers[l].weight.double() * sm[None])
+            Mk = Wm[:, keep]; c_ = Gk @ (Mk / Mk.norm(dim=1, keepdim=True).clamp_min(1e-300)).T
+            jj = c_.abs().argmax(1)
+            a_ = (W[:, keep] * Mk[jj]).sum(1) / (Mk[jj] ** 2).sum(1).clamp_min(1e-300)   # scale (and sign) onto the guess row
+            v_ = Wm[jj][:, S] * a_[:, None]
+            vals.append(torch.where(okc[None, :], v_, torch.full_like(v_, float("nan")))); ok_cols.append(okc)
+        if vals:
+            med = torch.stack(vals).nanmedian(0).values
+            have = torch.stack(ok_cols).any(0)
+            W[:, S[have]] = med[:, have]
+        print(f"[reanchor] L{l + 1}: {len(S)} prefix units the guess member cannot supply ({int((cnt == 0).sum())} missing, "
+              f"{int((cnt > 1).sum())} duplicated) -> columns filled from other members (per column: {[int(c) for c in torch.stack(ok_cols).sum(0)] if vals else []} members)", flush=True)
+    old = torch.cat([net.layers[l].weight, net.layers[l].bias[:, None]], 1).double()
+    new = torch.cat([W, guess0.layers[l].bias.double()[:, None]], 1)
+    cosd = torch.rad2deg(torch.acos(((old * new).sum(1) / (old.norm(dim=1) * new.norm(dim=1))).abs().clamp(max=1.)))
+    anchored[l] = (W.clone(), guess0.layers[l].bias.detach().double().clone())
+    with torch.no_grad():
+        net.layers[l].weight.copy_(W.to(net.layers[l].weight.dtype)); net.layers[l].bias.copy_(guess0.layers[l].bias)
+    print(f"[reanchor] L{l + 1}: guess rows rewritten over the refined L{l} units (match corr min {float(corr.min()):.6f}, "
+          f"{dims[l] - len(set(kk.tolist()))} refined units unmatched) | rows moved median {float(cosd.median()):.2f} deg, "
+          f"max {float(cosd.max()):.2f} deg", flush=True)
 
 
 def dup_pairs(l, ok, tol=1e-6):
@@ -282,7 +355,8 @@ def dup_fix(l, Wr, br, ok):
         pairs = dup_pairs(l, ok)
         if not pairs:
             return
-        G = torch.cat([guess0.layers[l].weight, guess0.layers[l].bias[:, None]], 1).double()
+        GW, GB = anchored.get(l, (guess0.layers[l].weight.double(), guess0.layers[l].bias.double()))
+        G = torch.cat([GW, GB[:, None]], 1).double()
         G = G / G.norm(dim=1, keepdim=True)
         R = torch.cat([net.layers[l].weight, net.layers[l].bias[:, None]], 1).double()
         R = R / R.norm(dim=1, keepdim=True)
@@ -293,7 +367,7 @@ def dup_fix(l, Wr, br, ok):
         for k in drop:
             ok[k] = False
             with torch.no_grad():
-                net.layers[l].weight[k] = guess0.layers[l].weight[k]; net.layers[l].bias[k] = guess0.layers[l].bias[k]
+                net.layers[l].weight[k] = GW[k].to(net.layers[l].weight.dtype); net.layers[l].bias[k] = GB[k].to(net.layers[l].bias.dtype)
         for k in drop:
             g0 = (net.layers[l].weight[k].clone(), net.layers[l].bias[k].clone())
             solved = False
@@ -305,7 +379,9 @@ def dup_fix(l, Wr, br, ok):
                     mag = float(torch.cat([g0[0], g0[1][None]]).norm()) / float(torch.cat([w_, b_[None]]).norm())
                     net.layers[l].weight[k] = mag * w_; net.layers[l].bias[k] = mag * b_
                 W2, b2, ok2, q = design_refine(l, [k], gate=a.dup_angle_gate); nq += q
-                if bool(ok2[k]) and distinct_candidate(k, W2[k], b2[k], Wr, br, ok):
+                # same tolerance as dup_pairs (cos > 1 - 1e-6 -> distance 1.4e-3): at depth two solves of ONE unit differ
+                # by ~1e-4, so the default 1e-5 let a re-solved copy through
+                if bool(ok2[k]) and distinct_candidate(k, W2[k], b2[k], Wr, br, ok, tol=2e-3):
                     Wr[k] = W2[k].double(); br[k] = b2[k].double(); ok[k] = True; solved = True
                     with torch.no_grad():
                         install(l, torch.tensor([k], device=dev), Wr, br)
@@ -336,6 +412,14 @@ if a.resume:
     print(f"[refine] resumed L1-L{a.start_layer - 1} from {a.resume} ({_r['queries']:,} queries) | "
           f"max eps {' '.join(f'{v:.1e}' for v in e[:2 * (a.start_layer - 1)])}", flush=True)
 def design_refine(layer, channels, gate=12.):
+    if a.design_unc_gate and a.design_from and layer + 1 >= a.design_from and not a.local_refine:
+        from peel.informative_kinks import recover_layer as rl_design
+        din = net.layers[layer].weight.shape[1]
+        W_, b_, m_, q_ = rl_design(T, net, layer, dev, only_channels=channels, gen=torch.Generator(device=dev).manual_seed(1234 + layer),
+                                   angle_gate=gate, need=max(400, 2 * din), pool=max(768, 2 * din), verbose=True, unc_gate=a.design_unc_gate)
+        _n = (W_.square().sum(1) + b_.square()).sqrt().clamp_min(1e-30)
+        W_[m_] = W_[m_] / _n[m_, None]; b_[m_] = b_[m_] / _n[m_]
+        return W_, b_, m_, q_
     if not a.local_refine:
         return _mlp_refine_layer(T,net,layer,dev,act,only_channels=channels,angle_gate=gate,design=True)
     from peel.informative_kinks import recover_layer
@@ -345,6 +429,8 @@ def design_refine(layer, channels, gate=12.):
 for l in range(a.start_layer - 1, len(dims) - 2):
     TRK["track_need"] = a.track_need_mult * dims[l]
     tl = time.time()
+    if a.reanchor and l >= 1:
+        reanchor(l)
     if a.prefix_check and l >= 2:
         for _round in range(2):
             bad = prefix_probe(l)
@@ -356,7 +442,19 @@ for l in range(a.start_layer - 1, len(dims) - 2):
             print(f"[prefix-check] after repair: L{l} max eps W {e[2 * (l - 1)]:.2e} b {e[2 * (l - 1) + 1]:.2e} (eval only)", flush=True)
     # layer 1: design sampler (wide input); deeper: cheap surface tracking (~1.3M q/layer), design only for the
     # units tracking leaves unsolved
-    if l == 0:
+    use_design = l == 0 or (a.design_from and l + 1 >= a.design_from)
+    if use_design and l > 0 and (a.design_need or a.design_unc_gate):
+        # same call as method._mlp_refine_layer(design=True) -> kink_solve.recover_layer(sampling="design"), with need set
+        from peel.informative_kinks import recover_layer as rl_design
+        din = net.layers[l].weight.shape[1]
+        print(f"  [design-refine] L{l + 1}: information-directed kink sampling, need {a.design_need or max(400, 2 * din)}, "
+              f"uncertainty gate {a.design_unc_gate or 1e-5:g}", flush=True)
+        Wr, br, ok, q = rl_design(T, net, l, dev, gen=torch.Generator(device=dev).manual_seed(1234 + l), angle_gate=12.0,
+                                  need=a.design_need or max(400, 2 * din), pool=max(768, 2 * din), verbose=True,
+                                  **({"unc_gate": a.design_unc_gate} if a.design_unc_gate else {}))
+        _n = (Wr.square().sum(1) + br.square()).sqrt().clamp_min(1e-30)
+        Wr[ok] = Wr[ok] / _n[ok, None]; br[ok] = br[ok] / _n[ok]
+    elif use_design:
         Wr, br, ok, q = _mlp_refine_layer(T, net, l, dev, act, angle_gate=12.0, design=True)
     elif a.local_refine:
         from peel.local_kink_refine import recover_layer
@@ -374,7 +472,7 @@ for l in range(a.start_layer - 1, len(dims) - 2):
     # Later candidate isolation must see the rows we actually recovered.
     with torch.no_grad():install(l,ok.nonzero().flatten(),Wr,br)
     left = (~ok).nonzero().flatten().tolist()
-    if left and l > 0:
+    if left and l > 0 and not use_design:                 # (design already ran on every row; same seed, same result)
         W2, b2, ok2, q = design_refine(l,left); nq += q
         for j in left:
             if bool(ok2[j]) and distinct_candidate(j,W2[j],b2[j],Wr,br,ok):
@@ -446,7 +544,7 @@ for l in range(a.start_layer - 1, len(dims) - 2):
                 print(f"[refine]   unit {j}: unsolved", flush=True)
     with torch.no_grad():
         install(l, ok.nonzero().flatten(), Wr, br)
-    if l > 0 and bool(ok.all()) and not a.local_refine:
+    if l > 0 and bool(ok.all()) and not a.local_refine and not use_design:
         # exactness check: the track gate (12 deg) can pass a row 1e-2 off (L3 unit, 9-layer run). Re-solve every
         # row with the light polish (fresh kink points bracketed at ~1e-5 around the row, 8 queries each); a row
         # that polishes to within 1e-4 takes the polished value, one that cannot be polished goes to design.

@@ -1208,6 +1208,10 @@ def main():
                          "parametrised as prefix(x) through the first K layers of the cached full teacher (seed --teacher-seed-full, "
                          "default 0), disagreement optimised over x -- the real peel's query distribution, with the prefix exact")
     ap.add_argument("--teacher-seed-full", type=int, default=0)
+    ap.add_argument("--tail-from", default="",
+                    help="'RECOVERED.pt:K' (MLP): committee on the tail of the --teacher-seed teacher of the recovery's dims. "
+                         "Students see h = the RECOVERED layers 1..K applied to x; the black box is the real full teacher "
+                         "queried at that x (tail_bb.py). --arch must equal the recovery's dims after K.")
     ap.add_argument("--loc-refine-l1", action="store_true",
                     help="(MLP peel) use the kink_solve solver for layer 1 too (the legacy layer-1 refiner rejects "
                          "11-15%% of correct consensus candidates; kink_solve solved 200/200 on the same record)")
@@ -1605,7 +1609,23 @@ def main():
 
     act = ("sigmoid" if args.sigmoid else "tanh" if args.tanh
            else "square" if args.square else args.act if args.act else "leaky_relu")
-    if args.teacher_full:
+    _tail_raw_dim = 0
+    if getattr(args, "tail_from", ""):
+        import tail_bb
+        _tp, _tK = args.tail_from.rsplit(":", 1); _tK = int(_tK)
+        _trec = torch.load(_tp, map_location=device, weights_only=False)
+        _tfd = list(_trec["dims"])
+        if _tfd[_tK:] != list(dims):
+            raise SystemExit(f"--tail-from: recovery dims {_tfd} after {_tK} layers = {_tfd[_tK:]}, must equal --arch {list(dims)}")
+        _tfull = make_teacher(_tfd, epochs=args.teacher_epochs, seed=args.teacher_seed, device=device, verbose=False, act=act)
+        for _p in _tfull.parameters():
+            _p.requires_grad_(False)
+        _tpre = MLP(_tfd, act=act).to(device).double(); _tpre.load_state_dict(_trec["state_dict"])
+        _query_map, teacher, eval_pts = tail_bb.setup(_tfull, _tpre, _tK, list(dims), act, device, q=args.q)
+        _tail_raw_dim = _tfd[0]
+        print(f"[setup] --tail-from {_tp}:{_tK}: students see the recovered layers 1..{_tK} of {_tfd} applied to x; "
+              f"black box = the full teacher at x (seed {args.teacher_seed})", flush=True)
+    elif args.teacher_full:
         # blackbox = a bigger trained teacher with its first `drop` layers removed;
         # queried DIRECTLY in the sub-net's input space (no L1, no inversion, no seal).
         full_dims = [int(x) for x in args.teacher_full.split(",")]
@@ -1861,6 +1881,8 @@ def main():
     if (getattr(args, "query_via_prefix", False) or getattr(args, "query_via_mlp_prefix", "")) and "_query_map" in dir() and _query_map is not None:
         overrides["query_map"] = _query_map
         overrides["query_raw_dim"] = 784 if args.query_via_prefix else int(args.query_via_mlp_prefix.split(":")[0].split(",")[0])
+    if getattr(args, "tail_from", ""):
+        overrides["query_map"] = _query_map; overrides["query_raw_dim"] = _tail_raw_dim
     if args.batch is not None:
         overrides["batch"] = args.batch
     if args.qg_tf32:
